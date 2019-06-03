@@ -1,0 +1,421 @@
+---
+title: "Final Project"
+author: "Teresa Chen; Ting-fen Lin"
+date: "5/12/2019"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+library("rio")
+library("here")
+library("tidyverse")
+library("janitor")
+library("knitr")
+library("fs")
+library("glue")
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE,
+                      error = TRUE,
+                      fig.width = 6.5,
+                      fig.height = 8
+                      )
+theme_set(theme_minimal(base_size = 8))
+
+```
+
+----------required packages----------
+
+library("rio")  
+library("here")  
+library("tidyverse")  
+library("janitor")  
+library("knitr")  
+library("fs")  
+library("signal")  
+library("glue")
+-----------------------------------
+
+
+## What's this project about?
+
+The main purpose of the project is to calculate two outcome variables indicating human **joint-joint coordination** and **variability of coordination** during body movement. These two variables are called *inter-joint continuous relative phase (CRP)* and *deviation phase (DP)*, respectily. They are widely used in the field of biomechanics, but to our knowlege there is no R function/package avalible designed for it. 
+
+
+### Description of data
+
+The data was collected in the Motion Analysis Lab at UO. Five participants were recruited. They were asked to perform level walking on a 15-m straight walkway for a couple times. A 12-camera motion analysis system with a set of 40 reflective markers was used to record the whole body movement during walking (Figure 1, left). From the marker trajectories (Figure 1, middle), 3-D human model was created (Figure 1, right) and **joint data** was then calculated for further analysis.  
+
+![Figure 1](plots/plot_model.jpg)  
+
+The goal of project is to create a shiny dashboard, which 1) prints the CRP and DP values, and 2) prints plots like Figure 2.  
+
+![Figure 2](plots/plot_matlab.jpg) 
+
+## Data Preparation
+
+### Import data
+
+```{r import_data}
+
+files <- dir_ls(here("data"), glob = "*.txt")
+batch <- map_df(files, import, setclass = "tbl_df", .id = "file")
+head(batch, 20L)
+
+```
+
+The **bacth** has data from 5 subjects.  
+
+Each subject has upto 5 trials, representing 5 times of walking.  
+
+Each trial generates 6 outcome variables, including:  
+
+* **hip angle**  
+* **hip velocity**  
+* **knee angle**  
+* **knee velocity**  
+* **ankle angle**   
+* **ankle velocity**  
+
+Each variable has 101 datapoints (rows), representing 0%-100% of walking cycle.
+
+There are a couple of issues to be solved before we can do further analysis:  
+
+1. Column names (variable names) are meaningless. They are V1 to V31.
+2. The first 4 rows of each iteration (subject) contain information we want:
+ + **trial**:  from trial 1 upto trial 5.
+ + **outcome measurement**: angle or velocity of hip, knee, and ankle
+
+### Tidy data
+
+One function (tidy_for_v) is designed to  
+
+1. turn meaningless names to meaningful names, representing each **outcome measurement** and 
+2. extract **trial** information . It takes data of 1 measurment as input.  
+
+
+
+Peer review note: Looks great, nice job! Here where you descibe the two functions I wonder if you might want to break it up into two seperate chuncks? I see the benefit of keeping them together as function #2 uses function #1 but in some ways it seems slightly easier to follow if you break it up into two pieces and move the text desribing function two. It just seems easier to get a grasp on the two functions that way, but just a thought, looks great either way. 
+
+```{r tidy_data}
+
+##-----------function 01: tidy data, using 1 vector (measurement) as input-----##
+
+tidy_for_v <- function(v){
+  v <- v %>% 
+  mutate(var = value[2],
+         trial = value[1],
+         trial = str_replace_all(trial, ".c3d", ""),
+         trial = str_replace_all(trial, "(......)_", ""),
+         var = tolower(var)) %>%
+  rename(frame = V1) %>% 
+  slice(-1:-5) %>% 
+  dplyr::select(trial, var, frame, value) 
+}
+
+```
+
+A second function (tidy_for_subject) is designed to apply aforementioned function to all meaningless variables (V2-V31). It takes the data of 1 subject as input.
+
+```{r tidy_data}
+##------------function 02: tidy data, using 1 subject's data as input---------------##
+##------------note: this function has another function(tidy_for_v) inside--------##
+
+tidy_for_subject <- function(data){
+  data_from_one_subject <- data %>% 
+    gather(temvar, value, V2:V31) %>% 
+    group_by(temvar) %>% 
+    nest() %>% 
+    mutate(tidy = map(data, tidy_for_v)) %>% 
+    dplyr::select(-data) %>%
+    unnest() 
+}
+
+
+tidy <- batch %>% 
+  mutate(file = str_replace_all(file, here("data"), ""),
+         id = parse_number(file)) %>% 
+  select(id, everything(), -file) %>% 
+  group_by(id) %>%
+  nest() %>% 
+  mutate(new_data = map(data, tidy_for_subject)) %>% 
+  dplyr::select(-data) %>%
+  unnest() %>%
+  dplyr::select(-temvar) %>%
+  filter(!is.na(value)) %>% 
+  mutate(id = as.factor(id),
+         trial = as.factor(trial),
+         var = factor(var, levels = c("right_hip_angle", "right_hip_velocity", 
+                                      "right_knee_angle", "right_knee_velocity", 
+                                      "right_ankle_angle", "right_ankle_velocity"),
+                      labels = c("hip angle", "hip velocity",
+                                 "knee angle", "knee velocity",
+                                 "ankle angle", "ankle velocity")),
+         frame = as.factor(frame),
+         value = as.numeric(value))
+
+
+head(tidy, 20L)
+str(tidy)
+```
+
+## Data Analysis
+
+### Built phase portrait
+
+Phase portrait is designed to plot the normalized angular positions $\Theta$ (x-axis) and the normalized angular velocities $\omega_{i}$ (y-axis). Angular positions and velocities were normalized using the following equations, where $\Theta_{i}$ and $\omega_{i}$ are the angular position and velocity for 101 data points during a walking cycle.  
+  
+  $$\Theta_{i}=\frac{2*[\Theta_{i}-min(\Theta_{i})]}{max(\Theta_{i})-min(\Theta_{i})}-1$$
+  $$\omega_{i}=\frac{\omega_{i}}{max(\omega_{i})} $$  
+  
+```{r normalize}
+
+##----------function 03: to normalize angle---------##
+
+normalize_angle <- function(angle){
+  
+norm_angle_data <- angle %>% 
+  mutate(norm_angle = (2* (value - min(value))/(max(value) - min(value))) - 1,
+         max_angle = max(norm_angle),
+         min_angle = min(norm_angle)) %>% 
+  rename(raw_angle = value)
+}
+
+## may consider using NSE here, substitue "value"
+
+# group_means <- function(data, frame, angle) {
+#     frame <- enquo(frame) # Quote the inputs
+#     value <- enquo(angle)
+#     
+#     data %>% select(!!value) %>%
+#      mutate(norm_angle = (2* (value - min(value))/(max(value) - min(value))) - 1,
+#          max_angle = max(norm_angle),
+#          min_angle = min(norm_angle)) %>% 
+#     rename(raw_angle = value)
+#         
+# }
+
+
+##-------------function 04: to normalize velocity----------##
+
+normalize_velocity <- function(velocity){
+  
+norm_velocity_data <- velocity %>% 
+  mutate(norm_velocity = value /max(abs(value)),
+         max_velocity = max(norm_velocity),
+         min_velocity = min(norm_velocity)) %>% 
+  rename(raw_velocity = value)
+  
+}
+
+normalize <- tidy %>% 
+  separate(var, into = c("joint", "measure")) %>% 
+  group_by(id, trial, joint, measure) %>% 
+  nest() %>% 
+  spread(measure, data) %>% 
+  mutate(norm_angle = map(angle, normalize_angle),
+         norm_velocity = map(velocity, normalize_velocity)) %>% 
+  dplyr::select(-angle, -velocity) %>% 
+  unnest() %>% 
+  dplyr::select(-frame1)
+
+head(normalize)
+```
+
+Peer review note: I wondered if you might want to add just a little bit more about the phase angle, the crp, and the dp before each chunk? I still felt slightly unsure what these were, and how they were useful. Maybe that is beyond the scope of what you want/need to include for this project but slightly more text, even another sentence, explaing each step might have made it slightly easier for me to get a grasp on the usefulness of each piece, but you've clearly put a lot of time and thought into this already and it looks great, and on the other hand more text might end up added clutter. Looks great. 
+
+
+```{r phase_portrait}
+
+## add ggplot labs ##
+
+phase_portrait <- normalize %>% 
+  group_by(id, trial, joint) %>% 
+  nest() %>% 
+  mutate(phase_portrait = pmap(list(id, trial, joint, data), 
+                                function(id, trial, joint, data){
+     data %>% ggplot(aes(norm_angle, norm_velocity)) +
+                           geom_point() +
+                           geom_path() +
+                           geom_point(data = filter(data, frame == 1), 
+                                     color = "red", size = 3) +
+                           geom_vline(xintercept = 0, color = "gray50") +
+                           geom_hline(yintercept = 0, color = "gray50") +
+                           labs(title = glue("Phase Portrait of {str_to_title(joint)} Joint"),
+                                subtitle = glue("Subjet #{id}, Trial #{trial}"),
+                                caption = "The red dot represents the start of cycle", 
+                                x = "Normalized Angle",
+                                y = "Normalized Velocity")}))
+
+
+head(phase_portrait)
+phase_portrait$phase_portrait[[1]]  ## example plot
+
+```
+
+
+### Calculate phase angle
+
+Phase angle($\varphi$) is calculated using the below equation along each data point and unwrapped to correct discontinuities occurred during angle computation.  
+
+
+ $$\varphi = \tan^{-1}(\frac{\omega}{\theta }) $$
+
+```{r phase_angle}
+
+phase_angle <- phase_portrait %>% 
+  mutate(phase_angle = map(data, function(data){
+    
+    tibble(frame = seq(1, 101, 1),
+           phase_angle = signal::unwrap((atan2(data$norm_velocity, data$norm_angle))) * 180 / pi)
+    
+    
+  })) %>% 
+  select(-phase_portrait, -data) %>% 
+  unnest() 
+
+
+head(phase_angle)
+
+```
+
+### Plot time-series phase angle plot
+
+```{r phase_angle_plot}
+
+
+phase_angle_plot <- phase_angle %>% 
+  group_by(id, trial, joint) %>% 
+  nest() %>% 
+  mutate(phase_angle_plot = pmap(list(id, trial, joint, data), 
+                                 function(id, trial, joint, data){
+    data %>%
+      ggplot(aes(x = frame, y = phase_angle)) +
+      geom_point() +
+      labs(title = glue("Phase Angle of {str_to_title(joint)} Joint During A Gait Cycle"),
+           subtitle = glue("Subjet #{id}, Trial #{trial}"),
+           y = "Phase Angle",
+           x = "% of Gait Cycle")
+  }))
+
+
+
+head(phase_angle_plot)
+phase_angle_plot$phase_angle_plot[[1]] ## example plot
+
+```
+
+
+### Calculate hip-knee CRP
+
+CRP is obtained by subtracting the phase angles of distal joint from that of proximal joint as follows. CRP identifies the coordination between two adjacent joints.
+  
+  $$CRP_{hip\cdot knee}=\varphi_{hip} - \varphi_{knee}$$
+ 
+ 
+```{r crp_hipknee}
+
+crp_hipknee <- phase_angle %>% 
+  filter(joint == "hip" | joint == "knee") %>% 
+  spread(joint, phase_angle) %>% 
+  mutate(crp_hipknee = hip - knee)
+
+
+head(crp_hipknee)
+```
+
+
+```{r crp_hipknee_plot}
+
+crp_hipknee_plot <- crp_hipknee %>% 
+  group_by(id, trial) %>% 
+  nest() %>% 
+  mutate(crp_hipknee_plot = pmap(list(id, trial, data), 
+                                 function(id, trial, data){
+    data %>% 
+      ggplot(aes(x = frame, y = crp_hipknee)) +
+      geom_point() +
+      labs(title = "Hip-Knee Continuous Relative Phase During A Gait Cycle",
+           subtitle = glue("Subject #{id}, Trial #{trial}"),
+           y = "CRP",
+           x = "% of Gait Cycle")
+    
+  }))
+
+
+head(crp_hipknee_plot)
+crp_hipknee_plot$crp_hipknee_plot[[1]] ## example plot
+```
+
+### Calculate knee-ankle CRP
+
+Similarly, knee-ankle CRP is obtained using the following eqution: 
+
+ $$CRP_{knee\cdot ankle}=\varphi_{knee} - \varphi_{ankle}$$
+  
+
+
+```{r crp_kneeankle}
+
+crp_kneeankle <- phase_angle %>% 
+  filter(joint == "knee" | joint == "ankle") %>% 
+  spread(joint, phase_angle) %>% 
+  mutate(crp_kneeankle = knee - ankle)
+
+head(crp_kneeankle)
+```
+
+```{r crp_kneeankle_plot}
+
+
+crp_kneeankle_plot <- crp_kneeankle %>% 
+  group_by(id, trial) %>% 
+  nest() %>% 
+  mutate(crp_kneeankle_plot = pmap(list(id, trial, data), 
+                                   function(id, trial, data){
+    data %>% 
+      ggplot(aes(x = frame, y = crp_kneeankle)) +
+      geom_point() +
+      labs(title = "Knee-Ankle Continuous Relative Phase During A Gait Cycle",
+           subtitle = glue("Subject #{id}, Trial #{trial}"),
+           y = "CRP",
+           x = "% of Gait Cycle")
+    
+  }))
+
+head(crp_kneeankle_plot)
+crp_kneeankle_plot$crp_kneeankle_plot[[1]]  ## example plot
+
+
+
+```
+
+### Calculate DP
+
+DP is the average value of all standard deviations calculated for each data point over a walking cycle from upto five CRP curves as follows.  
+
+$$mean(std(CRP_{i}))$$  
+
+
+```{r}
+
+dp <- crp_hipknee %>% 
+  left_join(crp_kneeankle) %>% 
+  group_by(id, frame) %>% 
+  summarise(crp_hipknee_sd = sd(crp_hipknee),
+            crp_kneeankle_sd = sd(crp_kneeankle)) %>% 
+  group_by(id) %>% 
+  summarise(dp_hipknee = mean(crp_hipknee_sd),
+            dp_kneeankle = mean(crp_kneeankle_sd))
+
+head(dp)
+```
+
+Peer review note: This looks really great. I changed or added a word here or there, and added a few notes mainly suggesting the possibility of considering adding one ore two additional sentances on the steps used to caclulate dp, crp, and phase angle. This looks really great to me, and it's clear that each step feeds into the next to complete a cohesive product. The introduction aids in outlining an overall goal and tying the pieces together. This is really effective as an overall product with a clear purpose and I think it is well thought out. The code seems compact and to the point I honestly don't have a lot of suggestions, and I think you've made an impressive product. Nice job! 
+\
+
+## To do list: 
+
+1. Combine plots from **phase_protrait**, **phase_angle_plot**, **crp_hipknee_plot**, **crp_kneeankle_plot**
+2. Lauch a Shiny dashboard
